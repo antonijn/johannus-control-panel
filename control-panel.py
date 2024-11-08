@@ -66,6 +66,10 @@ def wait_for_ready():
         if msg.type == 'sysex' and msg.data == ready_msg.data:
             break
 
+    # We ignore any key presses made while showing the loading screen
+    if isinstance(idevice, serial.Serial):
+        idevice.reset_input_buffer()
+
 def chain_screens(screens):
     for i in range(1, len(screens)):
         screens[i - 1].adjacent[Key.RIGHT] = screens[i]
@@ -147,8 +151,8 @@ class IntSelect(Screen):
         self.value = self.default
 
 class EnumSelect(IntSelect):
-    def __init__(self, name, options):
-        super().__init__(name, 0, 0, len(options) - 1)
+    def __init__(self, name, options, default=0):
+        super().__init__(name, default, 0, len(options) - 1)
         self.options = options
 
     def format_option(self):
@@ -185,6 +189,23 @@ class OnOffSelect(Screen):
         ddevice_writeln(format_arrows(self.name, left, right))
         ddevice_writeln(self.off_text if self.active else self.on_text)
 
+def read_escape_triplet(timeout):
+    idevice.timeout = timeout
+    while True:
+        bs = [b'', b'', b'']
+        full = b''
+        pattern = b'\x1b['
+        for i in range(len(bs)):
+            s = idevice.read()
+            if s == b'':
+                # Timeout reached
+                return b''
+            full += s
+            if not pattern.startswith(full[:len(pattern)]):
+                break
+        else:
+            return full
+
 reset_on_reload = []
 
 instruments = [
@@ -210,7 +231,7 @@ temperaments = [
     'Pythagorean',
     'Pyth. (B-F#)',
 ]
-temperament = EnumSelect('Temperament', temperaments)
+temperament = EnumSelect('Temperament', temperaments, default=1)
 temperament.on_update = lambda value: mdevice.send(AntonijnSysexEvent.TEMPERAMENT.midi_message(value))
 reset_on_reload.append(temperament)
 
@@ -254,6 +275,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Virtual MIDI device and control panel driver.',)
     parser.add_argument('--midi-name', default='Control Panel')
+    parser.add_argument('--blank-after', type=int, default=120)
     parser.add_argument('--tty')
     args = parser.parse_args()
 
@@ -267,12 +289,16 @@ if __name__ == "__main__":
     active_screen = instrument
     active_screen.redraw()
     while True:
-        s = idevice.read()
-        if s != b'\x1b':
-            continue
-        s += idevice.read()
-        if s != b'\x1b[':
-            continue
-        s += idevice.read()
-        if s in keymap:
+        # All key presses are handled in this loop
+        s = read_escape_triplet(args.blank_after)
+        if s == b'':
+            # Waiting mode
+            # Clear display
+            ddevice_writeln('')
+            ddevice_writeln('')
+
+            # Wait for input
+            read_escape_triplet(None)
+            active_screen.redraw()
+        elif s in keymap:
             active_screen.process_key(keymap[s])
