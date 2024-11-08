@@ -118,8 +118,8 @@ class IntSelect(Screen):
 
             if self.value != new_value:
                 self.value = new_value
-                self.redraw()
                 self.on_update(new_value)
+                self.redraw()
         else:
             if key in (Key.LEFT, Key.RIGHT):
                 super().process_key(key)
