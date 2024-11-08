@@ -91,12 +91,16 @@ class Screen:
     def redraw(self):
         pass
 
+    def reset(self):
+        pass
+
 class IntSelect(Screen):
     active = False
 
     def __init__(self, name, default, minimum, maximum, stride=1, unit_suffix=''):
         super().__init__()
         self.value = default
+        self.default = default
         self.name = name
         self.minimum = minimum
         self.maximum = maximum
@@ -139,6 +143,9 @@ class IntSelect(Screen):
         right = self.active and self.value < self.maximum
         ddevice_writeln(format_arrows(self.format_option(), left, right))
 
+    def reset(self):
+        self.value = self.default
+
 class EnumSelect(IntSelect):
     def __init__(self, name, options):
         super().__init__(name, 0, 0, len(options) - 1)
@@ -178,6 +185,8 @@ class OnOffSelect(Screen):
         ddevice_writeln(format_arrows(self.name, left, right))
         ddevice_writeln(self.off_text if self.active else self.on_text)
 
+reset_on_reload = []
+
 instruments = [
     'Modern Organ',
     'Positif',
@@ -186,6 +195,8 @@ instrument = EnumSelect('Instrument', instruments)
 def on_instrument_update(value):
     mdevice.send(AntonijnSysexEvent.INSTRUMENT.midi_message(value))
     wait_for_ready()
+    for screen in reset_on_reload:
+        screen.reset()
 instrument.on_update = on_instrument_update
 
 temperaments = [
@@ -201,8 +212,11 @@ temperaments = [
 ]
 temperament = EnumSelect('Temperament', temperaments)
 temperament.on_update = lambda value: mdevice.send(AntonijnSysexEvent.TEMPERAMENT.midi_message(value))
+reset_on_reload.append(temperament)
+
 transpose = IntSelect('Transpose', 0, -11, 11)
 transpose.on_update = lambda value: mdevice.send(AntonijnSysexEvent.TRANSPOSE.midi_message(value))
+
 recorder = OnOffSelect(
     'Record audio',
     '  START REC',
@@ -210,10 +224,15 @@ recorder = OnOffSelect(
     AntonijnSysexEvent.GRANDORGUE_START_RECORDING.midi_message(0),
     AntonijnSysexEvent.GRANDORGUE_STOP_RECORDING.midi_message(0),
 )
+
 met_bpm = IntSelect('Metron. BPM', 80, 1, 500)
 met_bpm.on_update = lambda value: mdevice.send(AntonijnSysexEvent.METRONOME_BPM.midi_message(value))
+reset_on_reload.append(met_bpm)
+
 met_div = IntSelect('Metron. div.', 4, 0, 32)
 met_div.on_update = lambda value: mdevice.send(AntonijnSysexEvent.METRONOME_MEASURE.midi_message(value))
+reset_on_reload.append(met_div)
+
 met = OnOffSelect(
     'Metronome',
     '  START',
