@@ -1,0 +1,21 @@
+[Unit]
+Description=Organ Control Panel
+
+[Quadlet]
+DefaultDependencies=false
+
+[Container]
+Image=localhost/johannus-control-panel:latest
+ContainerName=johannus-control-panel
+Exec=--tty /dev/ttyOrgan
+Annotation=run.oci.keep_original_groups=1
+AddDevice=/dev/serial/by-id/usb-Teensyduino_USB_Serial_12345-if00:/dev/ttyOrgan
+AddDevice=/dev/snd:/dev/snd
+Timezone=local
+Network=slirp4netns
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target
