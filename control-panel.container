@@ -7,12 +7,13 @@ DefaultDependencies=false
 [Container]
 Image=localhost/johannus-control-panel:latest
 ContainerName=johannus-control-panel
-Exec=--tty /dev/ttyOrgan
 Annotation=run.oci.keep_original_groups=1
-AddDevice=/dev/serial/by-id/usb-Teensyduino_USB_Serial_12345-if00:/dev/ttyOrgan
+AddDevice=/dev/serial/by-id/usb-Teensyduino_USB_Serial_12345-if00:/dev/ttySCRN
+AddDevice=/dev/serial/by-id/usb-Teensyduino_USB_Serial_3780290-if00:/dev/ttyREG
 AddDevice=/dev/snd:/dev/snd
 Timezone=local
 Network=slirp4netns
+Volume=/var/home/johannus/control-panel-data:/data:rw,Z
 
 [Service]
 Restart=always

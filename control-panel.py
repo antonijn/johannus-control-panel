@@ -1,18 +1,42 @@
-#!/usr/bin/env python3
-import argparse
+#!/usr/bin/env python
+import asyncio
+import aioserial
+import functools
 import mido
-import serial
+import os
 import sys
+import tomli_w
+import tomllib
 from enum import Enum, IntEnum
+
+print = functools.partial(print, flush=True)
 
 COLUMNS = 16
 ROWS = 2
 
+using_settings_path = None
+
 active_screen = None
 
 mdevice = None
-idevice = sys.stdin
-ddevice = sys.stdout
+display_inport = None
+display_outport = None
+reg_inport = None
+reg_outport = None
+
+tty_queue = asyncio.Queue()
+
+selected_stops = set()
+active_stops = set()
+stops_channel = 0
+
+piston = None
+manual_piston = None
+reed_cutoff = False
+
+piston_settings = {}
+
+
 
 class AntonijnSysexEvent(IntEnum):
     TRANSPOSE = 0x01
@@ -51,13 +75,13 @@ def format_arrows(text, left=True, right=True):
 
     return ('< ' if left else '  ') + text
 
-def ddevice_writeln(text):
+def display_outport_writeln(text):
     data = (text[:COLUMNS] + '\n').encode('utf-8')
-    ddevice.write(data)
+    display_outport.write(data)
 
 def wait_for_ready():
-    ddevice_writeln('Loading...')
-    ddevice_writeln('')
+    display_outport_writeln('Laden...')
+    display_outport_writeln('')
 
     # Wait for ready event
     ready_msg = AntonijnSysexEvent.GRANDORGUE_READY.midi_message(0)
@@ -67,13 +91,21 @@ def wait_for_ready():
             break
 
     # We ignore any key presses made while showing the loading screen
-    if isinstance(idevice, serial.Serial):
-        idevice.reset_input_buffer()
+    if isinstance(display_inport, aioserial.AioSerial):
+        display_inport.reset_input_buffer()
 
 def chain_screens(screens):
     for i in range(1, len(screens)):
         screens[i - 1].adjacent[Key.RIGHT] = screens[i]
         screens[i].adjacent[Key.LEFT] = screens[i - 1]
+
+def save_user_settings():
+    pset = {}
+    for pst, st in piston_settings.items():
+        pset[pst] = list(st)
+    dump_me = {'piston_settings': pset}
+    with open(user_settings_path, 'wb') as fd:
+        tomli_w.dump(dump_me, fd)
 
 class Key(Enum):
     LEFT = 1
@@ -94,6 +126,9 @@ class Screen:
 
     def redraw(self):
         pass
+
+    def should_redraw(self):
+        return False
 
     def reset(self):
         pass
@@ -141,11 +176,11 @@ class IntSelect(Screen):
     def redraw(self):
         left = not self.active and (Key.LEFT in self.adjacent)
         right = not self.active and (Key.RIGHT in self.adjacent)
-        ddevice_writeln(format_arrows(self.name, left, right))
+        display_outport_writeln(format_arrows(self.name, left, right))
 
         left = self.active and self.value > self.minimum
         right = self.active and self.value < self.maximum
-        ddevice_writeln(format_arrows(self.format_option(), left, right))
+        display_outport_writeln(format_arrows(self.format_option(), left, right))
 
     def reset(self):
         self.value = self.default
@@ -186,31 +221,93 @@ class OnOffSelect(Screen):
     def redraw(self):
         left = not self.active and (Key.LEFT in self.adjacent)
         right = not self.active and (Key.RIGHT in self.adjacent)
-        ddevice_writeln(format_arrows(self.name, left, right))
-        ddevice_writeln(self.off_text if self.active else self.on_text)
+        display_outport_writeln(format_arrows(self.name, left, right))
+        display_outport_writeln(self.off_text if self.active else self.on_text)
 
-def read_escape_triplet(timeout):
-    idevice.timeout = timeout
+class PistonSaveScreen(Screen):
+    def __init__(self):
+        super().__init__()
+
+    def can_save(self):
+        return piston is not None and piston != manual_piston
+
+    def process_key(self, key):
+        if key in (Key.LEFT, Key.RIGHT):
+            super().process_key(key)
+        elif key == Key.DOWN and self.can_save():
+            piston_settings[piston] = selected_stops.copy()
+            print(piston_settings)
+            save_user_settings()
+            self.redraw()
+
+    def redraw(self):
+        left = Key.LEFT in self.adjacent
+        right = Key.RIGHT in self.adjacent
+        display_outport_writeln(format_arrows('Combinatie', left, right))
+        text = ''
+        if self.can_save():
+            saved = piston_settings.get(piston, None)
+            if saved == selected_stops:
+                text = f'  {piston} opgeslagen'
+            else:
+                text = f'  {piston} OPSLAAN?'
+        display_outport_writeln(text)
+
+    def should_redraw(self):
+        return True
+
+
+async def read_arrow_keys(timeout):
+    display_inport.timeout = timeout
     while True:
-        bs = [b'', b'', b'']
         full = b''
         pattern = b'\x1b['
-        for i in range(len(bs)):
-            s = idevice.read()
+        for _ in range(3):
+            s = await display_inport.read_async()
             if s == b'':
                 # Timeout reached
-                return b''
+                await tty_queue.put(b'sleep\n')
+                break
             full += s
             if not pattern.startswith(full[:len(pattern)]):
                 break
         else:
-            return full
+            await tty_queue.put(full)
+
+async def read_reg_lines():
+    while True:
+        await tty_queue.put(await reg_inport.readline_async())
+
+def update_stop_selection(cmd):
+    words = cmd.strip().split(' ')
+    if words[0] != 'stop':
+        raise ValueError()
+
+    if len(words) % 2 != 1:
+        raise ValueError()
+
+    for i in range(1, len(words), 2):
+        on_or_off = words[i]
+        stops = {int(s) for s in words[i + 1].split(',')}
+        if on_or_off == 'on':
+            selected_stops.update(stops)
+        elif on_or_off == 'off':
+            selected_stops.difference_update(stops)
+        else:
+            raise ValueError()
+
+
+def send_stops(prev_active_stops):
+    for stop in active_stops.symmetric_difference(prev_active_stops):
+        msg_type = 'note_on' if stop in active_stops else 'note_off'
+        mdevice.send(mido.Message(msg_type, note=stop, channel=stops_channel))
+
 
 reset_on_reload = []
 
 instruments = [
-    'Modern Organ',
-    'Positif',
+    'Modern orgel',
+    'Positief',
 ]
 instrument = EnumSelect('Instrument', instruments)
 def on_instrument_update(value):
@@ -218,30 +315,33 @@ def on_instrument_update(value):
     wait_for_ready()
     for screen in reset_on_reload:
         screen.reset()
+    send_stops(set())
 instrument.on_update = on_instrument_update
 
 temperaments = [
-    'Original',
-    'Equal',
-    '1/4 Meantone',
-    '1/5 Meantone',
-    '1/6 Meantone',
-    '2/7 Meantone',
+    'Origineel',
+    'Gelijkzw.',
+    '1/4 Mdd.toon',
+    '1/5 Mdd.toon',
+    '1/6 Mdd.toon',
+    '2/7 Mdd.toon',
     'Werckmeister',
-    'Pythagorean',
+    'Pyth.',
     'Pyth. (B-F#)',
 ]
-temperament = EnumSelect('Temperament', temperaments, default=1)
+temperament = EnumSelect('Stemming', temperaments, default=1)
 temperament.on_update = lambda value: mdevice.send(AntonijnSysexEvent.TEMPERAMENT.midi_message(value))
 reset_on_reload.append(temperament)
 
-transpose = IntSelect('Transpose', 0, -11, 11)
+piston_save = PistonSaveScreen()
+
+transpose = IntSelect('Transpositie', 0, -11, 11)
 transpose.on_update = lambda value: mdevice.send(AntonijnSysexEvent.TRANSPOSE.midi_message(value))
 
 recorder = OnOffSelect(
-    'Record audio',
-    '  START REC',
-    '^ STOP REC',
+    'Opname',
+    '  START',
+    '^ STOP',
     AntonijnSysexEvent.GRANDORGUE_START_RECORDING.midi_message(0),
     AntonijnSysexEvent.GRANDORGUE_STOP_RECORDING.midi_message(0),
 )
@@ -255,50 +355,123 @@ met_div.on_update = lambda value: mdevice.send(AntonijnSysexEvent.METRONOME_MEAS
 reset_on_reload.append(met_div)
 
 met = OnOffSelect(
-    'Metronome',
+    'Metronoom',
     '  START',
     '^ STOP',
     AntonijnSysexEvent.GRANDORGUE_START_METRONOME.midi_message(0),
     AntonijnSysexEvent.GRANDORGUE_STOP_METRONOME.midi_message(0),
 )
 
-chain_screens([instrument, temperament, transpose, recorder, met_bpm, met_div, met])
+chain_screens([instrument, temperament, piston_save, transpose, recorder, met_bpm, met_div, met])
 
-keymap = {
-    b'\x1b[A': Key.UP,
-    b'\x1b[B': Key.DOWN,
-    b'\x1b[C': Key.RIGHT,
-    b'\x1b[D': Key.LEFT,
-}
+async def main():
+    global manual_piston, stops_channel
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description='Virtual MIDI device and control panel driver.',)
-    parser.add_argument('--midi-name', default='Control Panel')
-    parser.add_argument('--blank-after', type=int, default=120)
-    parser.add_argument('--tty')
-    args = parser.parse_args()
+    user_conf_dir = os.environ.get('XDG_CONFIG_HOME', os.path.join(os.getenv('HOME'), '.config'))
+    app_conf_dir = os.path.join(user_conf_dir, 'johannus-control-panel')
+    app_conf_dir = os.environ.get('CONTROL_PANEL_CONF', app_conf_dir)
 
-    mdevice = mido.open_ioport(args.midi_name, virtual=True)
-    if args.tty:
-        ddevice = serial.Serial(args.tty)
-        idevice = ddevice
+    conf_file = os.path.join(app_conf_dir, 'setup.toml')
+
+    with open(conf_file, 'rb') as fd:
+        conf = tomllib.load(fd)
+        midi = conf['midi']
+        midi_name = midi.get('name', 'Control Panel')
+        print('Name:', midi_name)
+        stops_channel = midi.get('stops_channel', 0)
+
+        system = conf['system']
+        display_tty = system.get('display_tty')
+        reg_tty = system.get('reg_tty')
+
+        display = conf['display']
+        blank_after = display.get('blank_after', 120)
+
+        organ = conf['organ']
+        manual_piston = organ.get('manual_piston_setting')
+        reed_stops = set(organ.get('reed_stops'))
+
+    global piston_settings, user_settings_path
+
+    user_settings_path = os.path.join(app_conf_dir, 'user-settings.toml')
+    if os.path.exists(user_settings_path):
+        with open(user_settings_path, 'rb') as fd:
+            conf = tomllib.load(fd)
+            for pst, stps in conf['piston_settings'].items():
+                piston_settings[pst] = set(stps)
+
+    global mdevice, display_outport, display_inport, reg_outport, reg_inport
+    global selected_stops, active_stops, active_screen, piston, reed_cutoff
+
+    mdevice = mido.open_ioport(midi_name, virtual=True)
+
+    display_outport = aioserial.AioSerial(display_tty)
+    display_inport = display_outport
+
+    reg_outport = aioserial.AioSerial(reg_tty)
+    reg_inport = reg_outport
 
     wait_for_ready()
+    send_stops(set())
+
+    asyncio.create_task(read_arrow_keys(blank_after))
+    asyncio.create_task(read_reg_lines())
+
+    screen_asleep = False
+
+    keymap = {
+        '\x1b[A': Key.UP,
+        '\x1b[B': Key.DOWN,
+        '\x1b[C': Key.RIGHT,
+        '\x1b[D': Key.LEFT,
+    }
 
     active_screen = instrument
     active_screen.redraw()
     while True:
-        # All key presses are handled in this loop
-        s = read_escape_triplet(args.blank_after)
-        if s == b'':
+        cmd = await tty_queue.get()
+        cmd = cmd.decode(errors='ignore')
+        if cmd == 'sleep\n':
             # Waiting mode
             # Clear display
-            ddevice_writeln('')
-            ddevice_writeln('')
+            display_outport_writeln('')
+            display_outport_writeln('')
+            screen_asleep = True
+        elif cmd in keymap:
+            if screen_asleep:
+                active_screen.redraw()
+                screen_asleep = False
+            else:
+                active_screen.process_key(keymap[cmd])
+        else:
+            print('Got command', repr(cmd))
 
-            # Wait for input
-            read_escape_triplet(None)
+            try:
+                if cmd.startswith('stop '):
+                    update_stop_selection(cmd)
+                elif cmd.startswith('piston '):
+                    piston = cmd[7:].strip()
+                elif cmd == 'reeds on\n':
+                    reed_cutoff = False
+                elif cmd == 'reeds off\n':
+                    reed_cutoff = True
+            except Exception as inst:
+                print(inst)
+
+        prev_active_stops = active_stops.copy()
+
+        if piston == manual_piston or piston not in piston_settings:
+            active_stops = selected_stops.copy()
+        else:
+            active_stops = piston_settings[piston].copy()
+
+        if reed_cutoff:
+            active_stops.difference_update(reed_stops)
+
+        send_stops(prev_active_stops)
+
+        if not screen_asleep and active_screen.should_redraw():
             active_screen.redraw()
-        elif s in keymap:
-            active_screen.process_key(keymap[s])
+
+if __name__ == "__main__":
+    asyncio.run(main())
